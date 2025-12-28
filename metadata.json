@@ -1,0 +1,8 @@
+{
+  "name": "Meet (میـت)",
+  "description": "A modern, Persian (RTL), self-hosted voice and text chat platform with a neon-glassmorphism aesthetic.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
