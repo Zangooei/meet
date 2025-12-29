@@ -5,15 +5,15 @@ import { Icon } from './Icon';
 import { socket } from '../services/api';
 import { useAuth } from '../context/AuthContext';
 
-// --- تنظیمات کیفیت ویدیو (برای اسکرین شیر) ---
-const SCREEN_CONSTRAINTS = {
-    video: { cursor: "always", frameRate: 30, width: 1280 }
-};
-
 interface VoiceGridProps {
   channel: Channel;
   onOpenDM: (targetId: number) => void;
 }
+
+const QUALITY_PRESETS = {
+    low: { label: 'صرفه‌جویی (720p)', constraints: { width: 1280, height: 720, frameRate: 15 } },
+    high: { label: 'کیفیت بالا (1080p)', constraints: { width: 1920, height: 1080, frameRate: 30 } }
+};
 
 export const VoiceGrid: React.FC<VoiceGridProps> = ({ channel, onOpenDM }) => {
   const { user: currentUser } = useAuth();
@@ -22,25 +22,113 @@ export const VoiceGrid: React.FC<VoiceGridProps> = ({ channel, onOpenDM }) => {
   const [isDeafened, setIsDeafened] = useState(false);
   const [isScreenSharing, setIsScreenSharing] = useState(false);
   const [spotlightId, setSpotlightId] = useState<number | null>(null);
+  const [showQualityModal, setShowQualityModal] = useState(false);
+  const [speakingUsers, setSpeakingUsers] = useState<Record<number, boolean>>({});
+  
+  // برای رندر مجدد کامپوننت وقتی استریم جدید می‌رسد
+  const [, forceUpdate] = useState(0);
 
-  // رفرنس‌ها برای جلوگیری از رندر اضافی و مدیریت تماس‌ها
   const peerInstance = useRef<Peer | null>(null);
   const myStream = useRef<MediaStream | null>(null);
   const screenStream = useRef<MediaStream | null>(null);
-  const callsRef = useRef<Record<string, any>>({}); // تماس‌های فعال
-  const audioRefs = useRef<Record<string, HTMLAudioElement>>({}); // المان‌های صدا
+  const callsRef = useRef<Record<string, any>>({});
+  const audioRefs = useRef<Record<string, HTMLAudioElement>>({});
+  const remoteStreams = useRef<Record<number, MediaStream>>({});
+  const peerIdMapRef = useRef<Record<string, number>>({});
+  const audioContextRef = useRef<AudioContext | null>(null);
+
+  // --- توابع کمکی ---
+  
+  const setupAudioAnalysis = (stream: MediaStream, userId: number) => {
+      try {
+          if (!audioContextRef.current) {
+              audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+          }
+          const ctx = audioContextRef.current;
+          if (ctx.state === 'suspended') ctx.resume();
+
+          if (stream.getAudioTracks().length === 0) return;
+
+          const source = ctx.createMediaStreamSource(stream);
+          const analyser = ctx.createAnalyser();
+          analyser.fftSize = 256;
+          source.connect(analyser);
+          
+          const checkVolume = () => {
+              if (!stream.active) return;
+              const dataArray = new Uint8Array(analyser.frequencyBinCount);
+              analyser.getByteFrequencyData(dataArray);
+              
+              let sum = 0;
+              for(let i = 0; i < dataArray.length; i++) sum += dataArray[i];
+              const average = sum / dataArray.length;
+
+              setSpeakingUsers(prev => {
+                  const isSpeaking = average > 15;
+                  if (prev[userId] === isSpeaking) return prev;
+                  return { ...prev, [userId]: isSpeaking };
+              });
+              requestAnimationFrame(checkVolume);
+          };
+          checkVolume();
+      } catch (e) { console.error("Audio analysis setup failed", e); }
+  };
+
+  const addMediaStream = (peerId: string, stream: MediaStream) => {
+      // 1. مدیریت صدا
+      if (!audioRefs.current[peerId]) {
+          const audio = document.createElement('audio');
+          audio.srcObject = stream;
+          audio.autoplay = true;
+          audio.style.display = 'none';
+          // اگر خودمان Deafen هستیم، صدای جدید را هم قطع کن
+          audio.muted = isDeafened; 
+          
+          audio.play().catch(e => console.log("Autoplay blocked:", e));
+          document.body.append(audio);
+          audioRefs.current[peerId] = audio;
+      } else {
+          // اگر المنت صدا بود، فقط استریم را آپدیت کن
+          audioRefs.current[peerId].srcObject = stream;
+          audioRefs.current[peerId].play().catch(() => {});
+      }
+
+      // 2. مدیریت ویدیو (برای Spotlight)
+      const userId = peerIdMapRef.current[peerId];
+      if (userId) {
+          remoteStreams.current[userId] = stream;
+          setupAudioAnalysis(stream, userId);
+          // اجبار به رندر مجدد تا ویدیو ظاهر شود
+          forceUpdate(n => n + 1);
+      }
+  };
+
+  // هندلر مشترک برای تماس‌ها
+  const registerCallEvents = (call: any, peerId: string) => {
+      call.on('stream', (remoteStream: MediaStream) => {
+          addMediaStream(peerId, remoteStream);
+      });
+      call.on('close', () => {
+          if (audioRefs.current[peerId]) {
+              audioRefs.current[peerId].remove();
+              delete audioRefs.current[peerId];
+          }
+          const userId = peerIdMapRef.current[peerId];
+          if (userId) delete remoteStreams.current[userId];
+      });
+      callsRef.current[peerId] = call;
+  };
 
   useEffect(() => {
-    // 1. دریافت صدای خودمان
     navigator.mediaDevices.getUserMedia({ video: false, audio: true })
     .then(stream => {
         myStream.current = stream;
+        if (currentUser) setupAudioAnalysis(stream, currentUser.id);
 
-        // 2. اتصال به سرور PeerJS (که روی VPS خودتان بالا آوردیم)
         const peer = new Peer(undefined as any, {
-            host: '/', // دامین فعلی (meet.codefather.ir)
-            port: 443, // پورت HTTPS
-            path: '/peerjs', // مسیری که در سرور ساختیم
+            host: '/',
+            port: 443,
+            path: '/peerjs',
             secure: true,
             config: {
                 iceServers: [
@@ -53,111 +141,63 @@ export const VoiceGrid: React.FC<VoiceGridProps> = ({ channel, onOpenDM }) => {
 
         peerInstance.current = peer;
 
-        // وقتی وصل شدیم و ID گرفتیم
         peer.on('open', (id) => {
-            console.log('✅ Connected to PeerServer, ID:', id);
-            // به بقیه خبر بده که من آمدم
-            socket.emit('join-voice', { 
-                channelId: channel.id, 
-                user: currentUser, 
-                peerId: id, 
-                isMuted, 
-                isDeafened 
-            });
+            socket.emit('join-voice', { channelId: channel.id, user: currentUser, peerId: id, isMuted, isDeafened });
         });
 
-        // وقتی کسی به ما زنگ زد (Answer)
         peer.on('call', (call) => {
-            console.log("📞 Incoming call...");
-            call.answer(stream); // پاسخ با صدای خودمان
-            
-            call.on('stream', (remoteStream) => {
-                console.log("🔊 Remote stream received");
-                addAudioStream(call.peer, remoteStream);
-            });
-
-            call.on('close', () => removeAudioStream(call.peer));
-            callsRef.current[call.peer] = call;
+            call.answer(stream); // پاسخ همیشه با صدای میکروفون ماست
+            registerCallEvents(call, call.peer);
         });
 
-        // وقتی سوکت خبر داد نفر جدیدی آمده -> به او زنگ بزن (Offer)
         socket.on('user-connected', (remotePeerId) => {
-            console.log("☎️ Calling new user:", remotePeerId);
-            // صبر کوتاه برای اطمینان از آماده بودن طرف مقابل
+            // وقتی کاربر جدید می‌آید، چک می‌کنیم آیا در حال اشتراک‌گذاری هستیم یا نه
             setTimeout(() => connectToNewUser(remotePeerId, stream, peer), 1000);
         });
     })
     .catch(err => console.error("Mic Error:", err));
 
-    // آپدیت لیست کاربران (برای نمایش در UI)
     socket.on('voice-update', (data: { channelId: number, users: any[] }) => {
         if (data.channelId === channel.id) {
             setConnectedUsers(data.users.map(u => ({ ...u, status: 'online' })));
+            const newMap: Record<string, number> = {};
+            data.users.forEach(u => { if (u.peerId) newMap[u.peerId] = u.id; });
+            peerIdMapRef.current = newMap;
         }
     });
 
-    // وقتی کسی رفت
     socket.on('user-disconnected', (peerId) => {
         if (callsRef.current[peerId]) callsRef.current[peerId].close();
-        removeAudioStream(peerId);
-        delete callsRef.current[peerId];
     });
 
     return () => {
-        // خروج کامل
         socket.emit('leave-voice');
         socket.off('user-connected');
         socket.off('user-disconnected');
         socket.off('voice-update');
-        
         if (peerInstance.current) peerInstance.current.destroy();
         if (myStream.current) myStream.current.getTracks().forEach(t => t.stop());
         if (screenStream.current) screenStream.current.getTracks().forEach(t => t.stop());
-        
-        // پاک کردن تمام صداها
         Object.values(audioRefs.current).forEach(audio => audio.remove());
-        audioRefs.current = {};
+        if (audioContextRef.current) audioContextRef.current.close();
     };
   }, [channel.id]);
 
-  // --- توابع کمکی ---
-
-  const connectToNewUser = (remotePeerId: string, stream: MediaStream, peer: Peer) => {
-      const call = peer.call(remotePeerId, stream);
+  // اتصال به کاربر جدید (هوشمند: اگر اسکرین شیر بود، تصویر هم بفرست)
+  const connectToNewUser = (remotePeerId: string, baseAudioStream: MediaStream, peer: Peer) => {
+      let streamToSend = baseAudioStream;
       
-      call.on('stream', (remoteStream) => {
-          console.log("🔊 Remote stream received (Caller side)");
-          addAudioStream(remotePeerId, remoteStream);
-      });
-      
-      call.on('close', () => removeAudioStream(remotePeerId));
-      callsRef.current[remotePeerId] = call;
-  };
-
-  const addAudioStream = (peerId: string, stream: MediaStream) => {
-      if (audioRefs.current[peerId]) return; // قبلاً اضافه شده
-
-      const audio = document.createElement('audio');
-      audio.srcObject = stream;
-      audio.autoplay = true;
-      audio.controls = false;
-      audio.style.display = 'none'; // مخفی
-      
-      // تلاش برای پخش (چون مرورگرها سخت‌گیرند)
-      audio.play().catch(e => console.log("Autoplay blocked:", e));
-      
-      document.body.append(audio);
-      audioRefs.current[peerId] = audio;
-  };
-
-  const removeAudioStream = (peerId: string) => {
-      if (audioRefs.current[peerId]) {
-          audioRefs.current[peerId].remove();
-          delete audioRefs.current[peerId];
+      // اگر در حال اشتراک‌گذاری هستیم، استریم ترکیبی بساز
+      if (screenStream.current) {
+          streamToSend = new MediaStream([
+              ...baseAudioStream.getAudioTracks(),
+              ...screenStream.current.getVideoTracks()
+          ]);
       }
-  };
 
-  // --- کنترل‌ها ---
+      const call = peer.call(remotePeerId, streamToSend);
+      registerCallEvents(call, remotePeerId);
+  };
 
   const toggleMute = () => {
       if (myStream.current) {
@@ -169,48 +209,114 @@ export const VoiceGrid: React.FC<VoiceGridProps> = ({ channel, onOpenDM }) => {
   };
 
   const toggleDeafen = () => {
-      // قطع صدای ورودی‌ها
-      Object.values(audioRefs.current).forEach(audio => {
-          audio.muted = !isDeafened;
-      });
-      setIsDeafened(!isDeafened);
-      socket.emit('user-toggle-state', { isMuted, isDeafened: !isDeafened });
+      const newState = !isDeafened;
+      Object.values(audioRefs.current).forEach(audio => { audio.muted = newState; });
+      setIsDeafened(newState);
+      socket.emit('user-toggle-state', { isMuted, isDeafened: newState });
   };
 
-  const handleShareClick = async () => {
-      if (isScreenSharing) {
-          if (screenStream.current) { screenStream.current.getTracks().forEach(t => t.stop()); screenStream.current = null; }
-          setIsScreenSharing(false);
-          // برگرداندن استریم صوتی به تماس‌ها (نیاز به replaceTrack دارد که اینجا ساده‌سازی شده و فقط قطع می‌کنیم)
-          // در PeerJS برای تعویض استریم، بهترین راه قطع و وصل تماس است یا استفاده از replaceTrack که پیچیده است.
-          // فعلاً فقط استیت را تغییر می‌دهیم.
-      } else {
-          try {
-              const stream = await navigator.mediaDevices.getDisplayMedia(SCREEN_CONSTRAINTS);
-              screenStream.current = stream;
-              setIsScreenSharing(true);
-              
-              // جایگزینی ترک ویدیویی در تماس‌های موجود
-              Object.values(callsRef.current).forEach((call: any) => {
-                  const sender = call.peerConnection.getSenders().find((s: any) => s.track.kind === 'video');
-                  if (sender) sender.replaceTrack(stream.getVideoTracks()[0]);
-                  // نکته: چون تماس اولیه صوتی بوده، شاید فرستنده ویدیو نداشته باشد.
-                  // در PeerJS ساده، معمولاً تماس جدیدی برای ویدیو برقرار می‌کنند.
-              });
+  // --- لاجیک اسکرین شیر (اصلاح شده: تماس مجدد) ---
 
-              stream.getVideoTracks()[0].onended = () => handleShareClick();
-          } catch (e) { console.error("Screen share failed", e); }
+  const initiateScreenShare = () => {
+      if (isScreenSharing) {
+          stopScreenShare();
+      } else {
+          setShowQualityModal(true);
       }
   };
 
-  const handleLeave = () => {
-      window.location.reload();
+  const stopScreenShare = () => {
+      if (screenStream.current) { 
+          screenStream.current.getTracks().forEach(t => t.stop()); 
+          screenStream.current = null; 
+      }
+      setIsScreenSharing(false);
+
+      // تماس مجدد با همه (فقط صدا)
+      if (myStream.current && peerInstance.current) {
+          Object.keys(callsRef.current).forEach(peerId => {
+              if (callsRef.current[peerId]) callsRef.current[peerId].close();
+              const call = peerInstance.current!.call(peerId, myStream.current!);
+              registerCallEvents(call, peerId);
+          });
+      }
   };
 
-  // --- رندر ---
+  const startScreenShare = async (qualityKey: 'low' | 'high') => {
+      setShowQualityModal(false);
+      try {
+          const constraints = QUALITY_PRESETS[qualityKey].constraints;
+          const displayStream = await navigator.mediaDevices.getDisplayMedia({ video: constraints, audio: false });
+          
+          screenStream.current = displayStream;
+          setIsScreenSharing(true);
+          
+          // ساخت استریم ترکیبی (میکروفون + تصویر)
+          const mixedStream = new MediaStream();
+          if (myStream.current) myStream.current.getAudioTracks().forEach(t => mixedStream.addTrack(t));
+          displayStream.getVideoTracks().forEach(t => mixedStream.addTrack(t));
+
+          // تماس مجدد با همه اعضا با استریم جدید
+          if (peerInstance.current) {
+              Object.keys(callsRef.current).forEach(peerId => {
+                  // بستن تماس قبلی (حیاتی برای اعمال تغییرات)
+                  if (callsRef.current[peerId]) callsRef.current[peerId].close();
+                  
+                  // تماس جدید
+                  const call = peerInstance.current!.call(peerId, mixedStream);
+                  registerCallEvents(call, peerId);
+              });
+          }
+
+          // هندل کردن دکمه "Stop Sharing" مرورگر
+          displayStream.getVideoTracks()[0].onended = () => {
+              stopScreenShare();
+          };
+      } catch (e) { console.error("Screen share failed", e); }
+  };
+
+  const handleLeave = () => { window.location.reload(); };
   
   const spotlightUser = connectedUsers.find(u => u.id === spotlightId);
   const otherUsers = connectedUsers.filter(u => u.id !== spotlightId);
+
+  // کامپوننت ویدیو
+  const UserVideo = ({ stream }: { stream: MediaStream }) => {
+      const videoRef = useRef<HTMLVideoElement>(null);
+      useEffect(() => {
+          if (videoRef.current && stream) videoRef.current.srcObject = stream;
+      }, [stream]);
+      return <video ref={videoRef} autoPlay playsInline className="w-full h-full object-contain bg-black" />;
+  };
+
+  const renderUserCard = (user: User, isSmall = false) => {
+      const isMe = String(user.id) === String(currentUser?.id);
+      const isSpeaking = speakingUsers[user.id] || false; 
+
+      return (
+        <div key={user.id} className={`relative bg-[#1a1a20] rounded-xl flex flex-col items-center justify-center transition-all duration-200 border-2 ${isSmall ? 'w-48 h-32 flex-shrink-0' : 'aspect-video'} hover:bg-[#25252b] group 
+            ${isSpeaking ? 'border-neonCyan shadow-[0_0_15px_rgba(6,182,212,0.8)]' : 'border-white/5'}`}>
+            
+            <div className="relative">
+                <img src={user.avatar} className={`${isSmall ? 'w-12 h-12' : 'w-20 h-20'} rounded-full object-cover mb-2 transition-transform ${isSpeaking ? 'scale-110' : ''}`} />
+                {user.isMuted && <div className="absolute bottom-0 right-0 bg-[#1a1a20] rounded-full p-1 border border-red-500 text-red-500"><Icon name="microphone" size={14} /></div>}
+                {user.isDeafened && <div className="absolute bottom-0 left-0 bg-[#1a1a20] rounded-full p-1 border border-red-500 text-red-500"><Icon name="headphones" size={14} /></div>}
+            </div>
+            
+            <span className="text-white font-bold mt-1 text-sm">{user.username}</span>
+            
+            {!isMe && (
+                <div className="absolute top-2 left-2 opacity-0 group-hover:opacity-100 transition-opacity bg-black/60 backdrop-blur-sm p-2 rounded-full z-20 cursor-pointer hover:bg-black/80 hover:text-neonCyan border border-white/10 shadow-lg">
+                    <button onClick={(e) => { e.stopPropagation(); onOpenDM(user.id); }} className="text-white hover:text-neonCyan transition-colors" title="ارسال پیام"><Icon name="message" size={20} /></button>
+                </div>
+            )}
+            
+            <div className="absolute bottom-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                <button onClick={() => setSpotlightId(user.id === spotlightId ? null : user.id)} className="text-gray-400 hover:text-white" title="حالت تمرکز"><Icon name="fullscreen" size={18} /></button>
+            </div>
+        </div>
+      );
+  };
 
   return (
     <div className="flex-1 bg-[#0f0f12] p-4 flex flex-col h-full relative overflow-hidden">
@@ -219,62 +325,53 @@ export const VoiceGrid: React.FC<VoiceGridProps> = ({ channel, onOpenDM }) => {
         <h2 className="text-2xl font-bold text-white flex items-center"><Icon name="volume" className="ml-3 text-neonCyan" /> {channel.name}</h2>
       </div>
 
+      {showQualityModal && (
+          <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm">
+              <div className="bg-[#1a1a20] p-6 rounded-2xl border border-neonCyan/30 shadow-2xl w-80 text-center animate-fade-in-up">
+                  <h3 className="text-white text-lg font-bold mb-4">کیفیت اشتراک‌گذاری</h3>
+                  <div className="space-y-3">
+                      <button onClick={() => startScreenShare('low')} className="w-full p-3 bg-white/5 hover:bg-white/10 rounded-xl flex items-center justify-between text-gray-200 transition-colors"><span>{QUALITY_PRESETS.low.label}</span></button>
+                      <button onClick={() => startScreenShare('high')} className="w-full p-3 bg-white/5 hover:bg-white/10 rounded-xl flex items-center justify-between text-gray-200 transition-colors"><span>{QUALITY_PRESETS.high.label}</span></button>
+                  </div>
+                  <button onClick={() => setShowQualityModal(false)} className="mt-4 text-sm text-red-400 hover:text-red-300">لغو</button>
+              </div>
+          </div>
+      )}
+
       <div className="flex-1 min-h-0 relative z-10 mb-4 overflow-y-auto">
           {spotlightId && spotlightUser ? (
-              // Spotlight View
               <div className="flex flex-col h-full gap-4">
                   <div className="flex-1 bg-black/40 rounded-2xl overflow-hidden border border-white/10 relative flex items-center justify-center p-2">
-                        <div className="flex flex-col items-center">
-                            <img src={spotlightUser.avatar} className="w-32 h-32 rounded-full mb-4 border-4 border-white/10 shadow-2xl" />
-                            <span className="text-2xl font-bold text-white">{spotlightUser.username}</span>
-                            <button onClick={() => setSpotlightId(null)} className="mt-4 px-4 py-2 bg-white/10 rounded-full hover:bg-white/20 text-sm">خروج از حالت تمرکز</button>
-                        </div>
+                        {(spotlightUser.id === currentUser?.id && isScreenSharing && screenStream.current) ? (
+                            <UserVideo stream={screenStream.current} />
+                        ) : (remoteStreams.current[spotlightUser.id] && remoteStreams.current[spotlightUser.id].getVideoTracks().length > 0) ? (
+                            <UserVideo stream={remoteStreams.current[spotlightUser.id]} />
+                        ) : (
+                            <div className="flex flex-col items-center">
+                                <img src={spotlightUser.avatar} className="w-32 h-32 rounded-full mb-4 border-4 border-white/10 shadow-2xl" />
+                                <span className="text-2xl font-bold text-white">{spotlightUser.username}</span>
+                                <button onClick={() => setSpotlightId(null)} className="mt-4 px-4 py-2 bg-white/10 rounded-full hover:bg-white/20 text-sm flex items-center gap-2"><Icon name="fullscreen" size={16} /> خروج از تمرکز</button>
+                            </div>
+                        )}
                   </div>
                   <div className="h-36 flex gap-3 overflow-x-auto pb-2 px-1 items-center shrink-0">
-                      {otherUsers.map(user => (
-                          <div key={user.id} onClick={() => setSpotlightId(user.id)} className="relative bg-[#1a1a20] rounded-xl flex flex-col items-center justify-center border-2 border-white/5 w-48 h-32 flex-shrink-0 hover:bg-[#25252b] cursor-pointer">
-                              <img src={user.avatar} className="w-12 h-12 rounded-full object-cover mb-2" />
-                              <span className="text-white font-bold text-xs">{user.username}</span>
-                          </div>
-                      ))}
+                      {otherUsers.map(user => renderUserCard(user, true))}
                   </div>
               </div>
           ) : (
-              // Grid View
               <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4 h-full content-start">
-                  {connectedUsers.map(user => {
-                      const isMe = String(user.id) === String(currentUser?.id);
-                      return (
-                        <div key={user.id} className="relative bg-[#1a1a20] rounded-xl flex flex-col items-center justify-center border-2 transition-all duration-300 border-white/5 aspect-video hover:bg-[#25252b]">
-                            <img src={user.avatar} className="w-20 h-20 rounded-full object-cover mb-2" />
-                            <span className="text-white font-bold mt-1 text-sm">{user.username}</span>
-                            
-                            {user.isMuted && <div className="absolute bottom-0 right-0 bg-[#1a1a20] rounded-full p-1 border border-red-500"><Icon name="microphone-slash" size={14} className="text-red-500" /></div>}
-                            
-                            {!isMe && (
-                                <div className="absolute top-2 left-2 opacity-0 hover:opacity-100 transition-opacity">
-                                    <button onClick={() => onOpenDM(user.id)} className="text-white hover:text-neonCyan"><Icon name="chat" size={16} /></button>
-                                </div>
-                            )}
-                            <div className="absolute bottom-2 right-2">
-                                <button onClick={() => setSpotlightId(user.id)} className="text-gray-500 hover:text-white"><Icon name="maximize" size={14} /></button>
-                            </div>
-                        </div>
-                      );
-                  })}
+                  {connectedUsers.map(user => renderUserCard(user))}
               </div>
           )}
       </div>
 
       <div className="mt-auto pt-2 flex flex-col items-center relative z-20 gap-4 shrink-0">
         <div className="flex gap-5 p-4 bg-[#1a1a20]/90 backdrop-blur-xl rounded-3xl border border-white/10 shadow-2xl items-center">
-           <button onClick={handleLeave} className="w-14 h-14 rounded-full bg-red-600 hover:bg-red-700 flex items-center justify-center text-white transition-all transform hover:scale-110 shadow-lg shadow-red-600/40"><Icon name="phone-slash" size={24} className="rotate-135" /></button>
-           <button onClick={toggleMute} className={`w-14 h-14 rounded-full flex items-center justify-center text-white transition-all transform hover:scale-110 ${isMuted ? 'bg-red-500 shadow-red-500/50' : 'bg-white/10 hover:bg-white/20'}`}><Icon name={isMuted ? "microphone-slash" : "microphone"} size={24} /></button>
-           <button onClick={toggleDeafen} className={`w-14 h-14 rounded-full flex items-center justify-center text-white transition-all transform hover:scale-110 ${isDeafened ? 'bg-red-500 shadow-red-500/50' : 'bg-white/10 hover:bg-white/20'}`}><Icon name="headphones" size={24} /></button>
+           <button onClick={handleLeave} className="w-14 h-14 rounded-full bg-red-600 hover:bg-red-700 flex items-center justify-center text-white transition-all transform hover:scale-110 shadow-lg shadow-red-600/40" title="خروج"><Icon name="phone-off" size={28} /></button>
+           <button onClick={toggleMute} className={`w-14 h-14 rounded-full flex items-center justify-center text-white transition-all transform hover:scale-110 ${isMuted ? 'bg-red-600 shadow-red-600/50' : 'bg-white/10 hover:bg-white/20'}`} title="میکروفون"><Icon name="microphone" size={24} /></button>
+           <button onClick={toggleDeafen} className={`w-14 h-14 rounded-full flex items-center justify-center text-white transition-all transform hover:scale-110 ${isDeafened ? 'bg-red-600 shadow-red-600/50' : 'bg-white/10 hover:bg-white/20'}`} title="صدا"><Icon name="headphones" size={24} /></button>
            <div className="w-px h-8 bg-white/20 mx-1"></div>
-           <button onClick={handleShareClick} className={`w-14 h-14 rounded-full flex items-center justify-center text-white transition-all transform hover:scale-110 ${isScreenSharing ? 'bg-blue-600 shadow-blue-500/50' : 'bg-white/10 hover:bg-white/20'}`} title="اشتراک گذاری صفحه">
-             <Icon name="video" size={24} />
-           </button>
+           <button onClick={initiateScreenShare} className={`w-14 h-14 rounded-full flex items-center justify-center text-white transition-all transform hover:scale-110 ${isScreenSharing ? 'bg-blue-600 shadow-blue-500/50' : 'bg-white/10 hover:bg-white/20'}`} title="اشتراک گذاری صفحه"><Icon name="video" size={24} /></button>
         </div>
       </div>
     </div>
