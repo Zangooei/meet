@@ -4,167 +4,175 @@ import { ChatArea } from './components/ChatArea';
 import { VoiceGrid } from './components/VoiceGrid';
 import { AuthPage } from './components/AuthPage';
 import { AuthProvider, useAuth } from './context/AuthContext';
-import { api } from './services/api';
+import { api, socket } from './services/api';
 import { Channel, Message } from './types';
-
-// Extend Window interface for PeerJS
-declare global {
-  interface Window {
-    Peer: any;
-  }
-}
 
 const MainApp = () => {
   const { user, logout, usersCache } = useAuth();
   const [channels, setChannels] = useState<Channel[]>([]);
-  const [activeChannelId, setActiveChannelId] = useState<number>(101);
+  const [activeChannelId, setActiveChannelId] = useState<number>(0);
   const [messages, setMessages] = useState<Message[]>([]);
-  const [connectedVoiceChannelId, setConnectedVoiceChannelId] = useState<number | null>(null);
-  const [peer, setPeer] = useState<any>(null);
+  const [isLoadingChannels, setIsLoadingChannels] = useState(true);
 
-  // Load Initial Data
+  // تابع باز کردن PV
+  const handleOpenDM = async (targetUserId: number) => {
+      if (!user) return;
+      if (user.id === targetUserId) return; // با خودت نمیشه چت کرد
+
+      try {
+          const dmChannel = await api.openDirectMessage(user.id, targetUserId);
+          
+          // اگر کانال قبلا در لیست نبود، اضافه‌ش کن
+          setChannels(prev => {
+              if (!prev.find(c => c.id === dmChannel.id)) {
+                  return [...prev, dmChannel];
+              }
+              return prev;
+          });
+
+          // برو به اون کانال
+          handleSelectChannel(dmChannel.id);
+      } catch (e) {
+          console.error("Failed to open DM", e);
+      }
+  };
+
   useEffect(() => {
     const fetchData = async () => {
-      const fetchedChannels = await api.getChannels();
-      setChannels(fetchedChannels);
-      
-      // Default to first channel
-      if (fetchedChannels.length > 0) {
-        setActiveChannelId(fetchedChannels[0].id);
-        const msgs = await api.getMessages(fetchedChannels[0].id);
-        setMessages(msgs);
+      try {
+        if (!user) return;
+        const fetchedChannels = await api.getChannels(user.id);
+        setChannels(fetchedChannels);
+        
+        if (fetchedChannels.length > 0) {
+          const initialId = fetchedChannels[0].id;
+          setActiveChannelId(initialId);
+          const msgs = await api.getMessages(initialId);
+          setMessages(msgs);
+          api.markChannelRead(initialId, user.id);
+        }
+      } catch (err) {
+        console.error("Error loading data:", err);
+      } finally {
+        setIsLoadingChannels(false);
       }
     };
     fetchData();
-  }, []);
+  }, [user]);
 
-  // Poll for messages (Simulating Socket.io 'new-message' event)
   useEffect(() => {
-    const interval = setInterval(async () => {
-      if (activeChannelId) {
-        const msgs = await api.getMessages(activeChannelId);
-        // Only update if length changed (simple check for demo)
-        setMessages(prev => {
-          if (prev.length !== msgs.length) return msgs;
-          return prev;
-        });
-      }
-    }, 2000);
-    return () => clearInterval(interval);
-  }, [activeChannelId]);
+    if (!activeChannelId) return;
+    socket.emit('join-text', activeChannelId);
 
-  // Handle Channel Selection
+    const handleNewMessage = (msg: Message) => {
+      if (activeChannelId === msg.channelId) {
+        setMessages(prev => {
+           if(prev.some(m => m.id === msg.id)) return prev;
+           return [...prev, msg];
+        });
+        if (user) api.markChannelRead(msg.channelId, user.id);
+      } else {
+        setChannels(prev => prev.map(c => 
+           c.id === msg.channelId ? { ...c, unreadCount: (c.unreadCount || 0) + 1 } : c
+        ));
+      }
+    };
+
+    // وقتی کسی به ما پیام خصوصی داد، لیست کانال‌ها آپدیت شه
+    const handleDMUpdate = async (data: { participants: number[], channelId: number }) => {
+        if (user && data.participants.includes(user.id)) {
+            const freshChannels = await api.getChannels(user.id);
+            setChannels(freshChannels);
+        }
+    };
+
+    const handleVoiceUpdate = (data: { channelId: number, users: any[] }) => {
+      setChannels(prevChannels => prevChannels.map(c => {
+        if (c.id === data.channelId) {
+          const updatedUsers = data.users.map(u => ({
+            id: u.id, username: u.username, avatar: u.avatar, status: 'online',
+            isSpeaking: u.isSpeaking || false, isMuted: u.isMuted, isDeafened: u.isDeafened, isScreenSharing: u.isScreenSharing
+          }));
+          return { ...c, users: updatedUsers };
+        }
+        return c;
+      }));
+    };
+
+    socket.on('new-message', handleNewMessage);
+    socket.on('voice-update', handleVoiceUpdate);
+    socket.on('dm-update', handleDMUpdate);
+
+    return () => {
+      socket.off('new-message', handleNewMessage);
+      socket.off('voice-update', handleVoiceUpdate);
+      socket.off('dm-update', handleDMUpdate);
+    };
+  }, [activeChannelId, user]);
+
   const handleSelectChannel = async (id: number) => {
-    const targetChannel = channels.find(c => c.id === id);
+    // چک کنیم کانال وجود دارد (ممکن است تازه اضافه شده باشد)
+    // اگر در لیست نبود (باگ لحظه‌ای)، فعلاً کاری نکنیم یا دوباره فچ کنیم
+    let targetChannel = channels.find(c => c.id === id);
+    
+    // اگر کانال جدید (DM) بود و هنوز در استیت نبود، موقتا پیداش کنیم
+    if (!targetChannel) {
+        const fresh = await api.getChannels(user?.id);
+        targetChannel = fresh.find(c => c.id === id);
+        if(targetChannel) setChannels(fresh);
+    }
+
     if (!targetChannel) return;
 
     setActiveChannelId(id);
 
-    if (targetChannel.type === 'text') {
+    if (targetChannel.type === 'text' || targetChannel.type === 'dm') {
       const msgs = await api.getMessages(id);
       setMessages(msgs);
+      if (user) {
+          api.markChannelRead(id, user.id);
+          setChannels(prev => prev.map(c => c.id === id ? { ...c, unreadCount: 0 } : c));
+      }
     } 
-    else if (targetChannel.type === 'voice') {
-       if (connectedVoiceChannelId !== id) {
-           joinVoiceChannel(id);
-       }
-    }
-  };
-
-  const joinVoiceChannel = (channelId: number) => {
-    if (!user) return;
-
-    console.log(`Connecting to voice channel ${channelId} via PeerJS...`);
-    setConnectedVoiceChannelId(channelId);
-
-    // --- VPS SELF-HOSTED PEERJS CONFIGURATION ---
-    // To use your own VPS, uncomment and update the object below:
-    /*
-    const peerOptions = {
-        host: 'your-vps-ip-address.com',
-        port: 9000,
-        path: '/myapp',
-        secure: true, // true if you have SSL
-    };
-    */
-   
-    // For this demo to work immediately without your VPS, we use default cloud:
-    const peerOptions = { debug: 2 }; 
-    
-    const newPeer = new window.Peer(undefined, peerOptions);
-
-    newPeer.on('open', (id: string) => {
-      console.log('My peer ID is: ' + id);
-    });
-    
-    newPeer.on('error', (err: any) => {
-        console.error("PeerJS Error:", err);
-    });
-    
-    // Simulate user joining in UI state (Optimistic UI)
-    setChannels(prev => prev.map(c => {
-        // Remove from old
-        if (c.id === connectedVoiceChannelId) {
-             return { ...c, users: c.users?.filter(u => u.id !== user.id) };
-        }
-        // Add to new
-        if (c.id === channelId) {
-            return { ...c, users: [...(c.users || []), { ...user, isSpeaking: false }] };
-        }
-        return c;
-    }));
-
-    setPeer(newPeer);
   };
 
   const handleSendMessage = async (text: string, file?: File) => {
     if (!user) return;
     try {
       await api.sendMessage(text, activeChannelId, user.id, file);
-      // State updates automatically via polling in this architecture, 
-      // but for instant feedback we can fetch immediately
-      const msgs = await api.getMessages(activeChannelId);
-      setMessages(msgs);
-    } catch (e) {
-      console.error("Failed to send", e);
-    }
+    } catch (e) { console.error("Failed to send", e); }
   };
+
+  if (!user) return null;
+  if (isLoadingChannels) return <div className="flex h-screen w-screen items-center justify-center bg-[#0f0f12] text-white">در حال بارگزاری اطلاعات ...</div>;
 
   const activeChannel = channels.find(c => c.id === activeChannelId) || channels[0];
 
-  if (!user || !activeChannel) return null;
-
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-[#0f0f12] text-gray-200 font-sans" dir="rtl">
-      {/* Sidebar */}
       <Sidebar 
         channels={channels}
         activeChannelId={activeChannelId}
         onSelectChannel={handleSelectChannel}
         currentUser={user}
+        usersCache={usersCache} // ارسال لیست یوزرها برای نمایش نام درست در سایدبار
       />
-
-      {/* Main Content */}
       <main className="flex-1 flex flex-col min-w-0 bg-[#0f0f12] relative z-10">
         <div className="absolute top-4 left-4 z-50">
-             <button onClick={logout} className="bg-red-500/10 hover:bg-red-500/20 text-red-500 px-3 py-1 rounded border border-red-500/20 text-xs transition-colors">
-                 خروج از حساب
-             </button>
+             <button onClick={logout} className="bg-red-500/10 hover:bg-red-500/20 text-red-500 px-3 py-1 rounded border border-red-500/20 text-xs transition-colors">خروج</button>
         </div>
-
-        {activeChannel.type === 'text' ? (
+        {activeChannel?.type === 'voice' ? (
+           <VoiceGrid channel={activeChannel} onOpenDM={handleOpenDM} />
+        ) : (
            <ChatArea 
              channel={activeChannel}
              messages={messages}
              users={usersCache}
              onSendMessage={handleSendMessage}
+             onOpenDM={handleOpenDM} // ارسال تابع به چت برای کلیک روی آواتارها
            />
-        ) : (
-           <VoiceGrid channel={activeChannel} />
         )}
       </main>
-      
-      {/* Background Decor */}
       <div className="fixed top-0 left-0 w-full h-full pointer-events-none z-0 overflow-hidden">
         <div className="absolute top-[-20%] left-[-10%] w-[50%] h-[50%] bg-neonPurple/5 rounded-full blur-[120px]"></div>
         <div className="absolute bottom-[-20%] right-[-10%] w-[50%] h-[50%] bg-neonCyan/5 rounded-full blur-[120px]"></div>
@@ -173,7 +181,6 @@ const MainApp = () => {
   );
 };
 
-// Root Component wrapping Auth
 function App() {
   return (
     <AuthProvider>
@@ -181,19 +188,9 @@ function App() {
     </AuthProvider>
   );
 }
-
 const AppContent = () => {
   const { isAuthenticated, isLoading } = useAuth();
-
-  if (isLoading) {
-    return (
-      <div className="min-h-screen bg-[#0f0f12] flex items-center justify-center">
-        <div className="w-8 h-8 border-2 border-neonCyan border-t-transparent rounded-full animate-spin"></div>
-      </div>
-    );
-  }
-
+  if (isLoading) return <div className="min-h-screen bg-[#0f0f12] flex items-center justify-center">Loading...</div>;
   return isAuthenticated ? <MainApp /> : <AuthPage />;
 };
-
 export default App;

@@ -1,34 +1,12 @@
+import { io, Socket } from 'socket.io-client';
 import { User, Message, Channel, LoginCredentials, RegisterCredentials, AuthResponse } from '../types';
-import { INITIAL_CHANNELS, INITIAL_MESSAGES, MOCK_USERS } from '../constants';
 
-// --- MOCK DATABASE (LocalStorage) ---
-const DB_KEYS = {
-  USERS: 'meet_users',
-  CHANNELS: 'meet_channels',
-  MESSAGES: 'meet_messages',
-  CURRENT_USER_ID: 'meet_current_user_id',
-  TOKEN: 'meet_auth_token'
-};
+const API_URL = '/api'; 
+export const socket = io("https://meet.codefather.ir", {
+  transports: ["websocket"], // این خط حیاتیه
+  upgrade: false
+});
 
-// Initialize Mock DB if empty
-const initDB = () => {
-  if (!localStorage.getItem(DB_KEYS.USERS)) {
-    localStorage.setItem(DB_KEYS.USERS, JSON.stringify(MOCK_USERS));
-  }
-  if (!localStorage.getItem(DB_KEYS.CHANNELS)) {
-    localStorage.setItem(DB_KEYS.CHANNELS, JSON.stringify(INITIAL_CHANNELS));
-  }
-  if (!localStorage.getItem(DB_KEYS.MESSAGES)) {
-    localStorage.setItem(DB_KEYS.MESSAGES, JSON.stringify(INITIAL_MESSAGES));
-  }
-};
-
-initDB();
-
-// Helper: Simulate Network Delay
-const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-
-// Helper: File to Base64 (Simulating File Upload to Server)
 const fileToBase64 = (file: File): Promise<string> => {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -39,116 +17,88 @@ const fileToBase64 = (file: File): Promise<string> => {
 };
 
 export const api = {
-  // --- AUTH ENDPOINTS ---
+  login: async (creds: LoginCredentials): Promise<AuthResponse> => {
+    const res = await fetch(`${API_URL}/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(creds) });
+    if (!res.ok) throw new Error('Login failed');
+    const data = await res.json();
+    localStorage.setItem('meet_token', data.token);
+    localStorage.setItem('meet_user', JSON.stringify(data.user));
+    return data;
+  },
+
+  register: async (creds: RegisterCredentials): Promise<AuthResponse> => {
+    let avatarBase64 = undefined;
+    if (creds.avatar && creds.avatar instanceof File) avatarBase64 = await fileToBase64(creds.avatar);
+    const res = await fetch(`${API_URL}/auth/register`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: creds.username, password: creds.password, avatar: avatarBase64 }) });
+    if (!res.ok) throw new Error('Register failed');
+    const data = await res.json();
+    localStorage.setItem('meet_token', data.token);
+    localStorage.setItem('meet_user', JSON.stringify(data.user));
+    return data;
+  },
+
+  logout: () => { localStorage.removeItem('meet_token'); localStorage.removeItem('meet_user'); socket.disconnect(); window.location.reload(); },
   
-  login: async (credentials: LoginCredentials): Promise<AuthResponse> => {
-    await delay(800);
-    const users: User[] = JSON.parse(localStorage.getItem(DB_KEYS.USERS) || '[]');
-    
-    // In a real backend, we would hash/check password
-    const user = users.find(u => u.username === credentials.username);
-    
-    if (!user) {
-      throw new Error('نام کاربری یا رمز عبور اشتباه است');
-    }
-
-    const token = `mock_jwt_token_${user.id}_${Date.now()}`;
-    localStorage.setItem(DB_KEYS.TOKEN, token);
-    localStorage.setItem(DB_KEYS.CURRENT_USER_ID, String(user.id));
-    
-    return { user, token };
-  },
-
-  register: async (credentials: RegisterCredentials): Promise<AuthResponse> => {
-    await delay(1500);
-    const users: User[] = JSON.parse(localStorage.getItem(DB_KEYS.USERS) || '[]');
-    
-    if (users.find(u => u.username === credentials.username)) {
-      throw new Error('این نام کاربری قبلاً گرفته شده است');
-    }
-
-    let avatarUrl = 'https://picsum.photos/200'; // Default
-    if (credentials.avatar) {
-      avatarUrl = await fileToBase64(credentials.avatar);
-    }
-
-    const newUser: User = {
-      id: users.length > 0 ? Math.max(...users.map(u => u.id)) + 1 : 1,
-      username: credentials.username,
-      avatar: avatarUrl,
-      status: 'online',
-      isMuted: false,
-      isDeafened: false
-    };
-
-    users.push(newUser);
-    localStorage.setItem(DB_KEYS.USERS, JSON.stringify(users));
-    
-    const token = `mock_jwt_token_${newUser.id}_${Date.now()}`;
-    localStorage.setItem(DB_KEYS.TOKEN, token);
-    localStorage.setItem(DB_KEYS.CURRENT_USER_ID, String(newUser.id));
-
-    return { user: newUser, token };
-  },
-
-  logout: async () => {
-    localStorage.removeItem(DB_KEYS.TOKEN);
-    localStorage.removeItem(DB_KEYS.CURRENT_USER_ID);
-  },
-
   checkSession: async (): Promise<User | null> => {
-    await delay(500);
-    const token = localStorage.getItem(DB_KEYS.TOKEN);
-    const userId = localStorage.getItem(DB_KEYS.CURRENT_USER_ID);
-    
-    if (!token || !userId) return null;
-
-    const users: User[] = JSON.parse(localStorage.getItem(DB_KEYS.USERS) || '[]');
-    const user = users.find(u => u.id === Number(userId));
-    
-    return user || null;
+    const stored = localStorage.getItem('meet_user');
+    if (stored) { socket.connect(); return JSON.parse(stored); }
+    return null;
   },
 
-  // --- DATA ENDPOINTS ---
+  updateProfile: async (userId: number, status?: string, bio?: string) => {
+      await fetch(`${API_URL}/users/profile`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ userId, status, bio }) });
+  },
 
-  getChannels: async (): Promise<Channel[]> => {
-    return JSON.parse(localStorage.getItem(DB_KEYS.CHANNELS) || '[]');
+  getChannels: async (userId?: number): Promise<Channel[]> => {
+    const res = await fetch(userId ? `${API_URL}/channels?userId=${userId}` : `${API_URL}/channels`);
+    return res.json();
+  },
+
+  markChannelRead: async (channelId: number, userId: number) => {
+    await fetch(`${API_URL}/channels/${channelId}/read`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ userId }) });
+  },
+
+  openDirectMessage: async (myId: number, targetId: number): Promise<Channel> => {
+    const res = await fetch(`${API_URL}/dm`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ myId, targetId }) });
+    return res.json();
   },
 
   getMessages: async (channelId: number): Promise<Message[]> => {
-    const allMessages: Message[] = JSON.parse(localStorage.getItem(DB_KEYS.MESSAGES) || '[]');
-    return allMessages.filter(m => m.channelId === channelId);
+    const res = await fetch(`${API_URL}/messages/${channelId}`);
+    return res.json();
   },
 
-  sendMessage: async (content: string, channelId: number, userId: number, file?: File): Promise<Message> => {
-    await delay(300);
-    const allMessages: Message[] = JSON.parse(localStorage.getItem(DB_KEYS.MESSAGES) || '[]');
-    
-    let fileUrl = undefined;
-    let fileType: any = undefined;
+  uploadFile: async (file: File): Promise<{ url: string, filename: string, mimetype: string, size: number }> => {
+      const formData = new FormData();
+      formData.append('file', file);
+      const res = await fetch(`${API_URL}/upload`, { method: 'POST', body: formData });
+      if (!res.ok) throw new Error('Upload failed');
+      return res.json();
+  },
 
+  sendMessage: async (content: string, channelId: number, userId: number, file?: File, replyToId?: number): Promise<Message> => {
+    let attachment = undefined;
     if (file) {
-      fileUrl = await fileToBase64(file);
-      fileType = file.type.startsWith('image/') ? 'image' : file.type.startsWith('video/') ? 'video' : 'file';
+        try {
+            const up = await api.uploadFile(file);
+            let type: any = 'file';
+            if (file.type.startsWith('image/')) type = 'image';
+            else if (file.type.startsWith('audio/')) type = 'audio';
+            else if (file.type.startsWith('video/')) type = 'video';
+            attachment = { type, url: up.url, name: up.filename, size: up.size };
+        } catch (e) { console.error("Upload error", e); throw e; }
     }
-
-    const newMessage: Message = {
-      id: allMessages.length + 1,
-      content,
-      channelId,
-      userId,
-      fileUrl,
-      fileType,
-      createdAt: new Date().toISOString()
-    };
-
-    allMessages.push(newMessage);
-    localStorage.setItem(DB_KEYS.MESSAGES, JSON.stringify(allMessages));
-    
-    return newMessage;
+    const res = await fetch(`${API_URL}/messages`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content, channelId, userId, attachment, replyToId }) });
+    return res.json();
   },
-  
-  getUsers: async (): Promise<User[]> => {
-    return JSON.parse(localStorage.getItem(DB_KEYS.USERS) || '[]');
-  }
+
+  editMessage: async (id: number, content: string) => {
+      await fetch(`${API_URL}/messages/${id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content }) });
+  },
+
+  deleteMessage: async (id: number) => {
+      await fetch(`${API_URL}/messages/${id}`, { method: 'DELETE' });
+  },
+
+  getUsers: async (): Promise<User[]> => { const res = await fetch(`${API_URL}/users`); return res.json(); }
 };
