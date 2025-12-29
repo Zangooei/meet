@@ -6,6 +6,7 @@ const path = require('path');
 const cors = require('cors');
 const multer = require('multer');
 const { ExpressPeerServer } = require('peer'); // Import PeerJS Server
+const bcrypt = require('bcrypt');
 
 const app = express();
 app.use(cors());
