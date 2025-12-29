@@ -33,6 +33,34 @@ const upload = multer({ storage, limits: { fileSize: 100 * 1024 * 1024 } });
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" }, maxHttpBufferSize: 1e8 });
 
+// function fileToDataImage(filePath) {
+//     try {
+//         const abs = path.join(__dirname, filePath);
+//         const buffer = fs.readFileSync(abs);
+//         const ext = path.extname(abs).substring(1);
+//         return `data:image/${ext};base64,${buffer.toString('base64')}`;
+//     } catch {
+//         return null;
+//     }
+// }
+
+function fileToDataImage(avatarUrl) {
+    try {
+        if (avatarUrl.startsWith('http')) return avatarUrl;
+        const relativePath = avatarUrl.startsWith('/') ? avatarUrl.substring(1) : avatarUrl;
+        const absPath = path.join(__dirname, relativePath);
+        if (fs.existsSync(absPath)) {
+            const buffer = fs.readFileSync(absPath);
+            const ext = path.extname(absPath).substring(1) || 'png';
+            return `data:image/${ext};base64,${buffer.toString('base64')}`;
+        }
+        return null;
+    } catch (error) {
+        console.error("Error converting file to Base64:", error);
+        return null;
+    }
+}
+
 // --- PeerJS Server Setup (CRITICAL FOR NEW VOICE SYSTEM) ---
 const peerServer = ExpressPeerServer(server, {
     debug: true,
@@ -98,11 +126,62 @@ app.post('/api/channels/:id/read', (req, res) => {
 
 app.post('/api/auth/register', (req, res) => {
     const { username, password, avatar } = req.body;
-    if (db.users.find(u => u.username === username)) return res.status(400).json({ message: "Duplicate" });
-    const u = { id: Date.now(), username, password: bcrypt.hashSync(password, 8), avatar: avatar || `https://api.dicebear.com/7.x/avataaars/svg?seed=${username}`, status: 'online', bio: '' };
-    db.users.push(u); saveDB();
+    if (db.users.find(u => u.username === username)) {
+        return res.status(400).json({ message: "Duplicate" });
+    }
+    let avatarPath = avatar || `https://api.dicebear.com/7.x/avataaars/svg?seed=${username}`;
+    if (avatar && avatar.startsWith('data:image')) {
+        try {
+            const base64Data = avatar.replace(/^data:image\/\w+;base64,/, "");
+            const buffer = Buffer.from(base64Data, 'base64');
+            const fileName = `avatar-${Date.now()}-${Math.round(Math.random() * 1E9)}.png`;
+            const fullPath = path.join(__dirname, 'uploads', fileName);
+            fs.writeFileSync(fullPath, buffer);
+            avatarPath = `/uploads/${fileName}`;
+        } catch (err) {
+            console.error("Error saving avatar Base64:", err);
+        }
+    }
+    const u = { 
+        id: Date.now(), 
+        username, 
+        password: bcrypt.hashSync(password, 8), 
+        avatar: avatarPath, 
+        status: 'online', 
+        bio: '' 
+    };
+    db.users.push(u); 
+    saveDB();
     res.json({ user: { ...u, password: '' }, token: 'jwt-' + u.id });
 });
+// app.post('/api/auth/register', (req, res) => {
+//     const { username, password, avatar } = req.body;
+//     if (db.users.find(u => u.username === username)) return res.status(400).json({ message: "Duplicate" });
+//     const u = { id: Date.now(), username, password: bcrypt.hashSync(password, 8), avatar: avatar || `https://api.dicebear.com/7.x/avataaars/svg?seed=${username}`, status: 'online', bio: '' };
+//     db.users.push(u); saveDB();
+//     res.json({ user: { ...u, password: '' }, token: 'jwt-' + u.id });
+// });
+// app.post('/api/auth/register', (req, res) => {
+//     const { username, password, avatarPath } = req.body;
+
+//     if (db.users.find(u => u.username === username))
+//         return res.status(400).json({ message: "Duplicate" });
+
+//     const u = {
+//         id: Date.now(),
+//         username,
+//         password: bcrypt.hashSync(password, 8),
+//         avatar: avatarPath || null, // 👈 فقط path
+//         status: 'online',
+//         bio: ''
+//     };
+
+//     db.users.push(u);
+//     saveDB();
+
+//     const { password: _, ...safeUser } = u;
+//     res.json({ user: safeUser, token: 'jwt-' + u.id });
+// });
 
 app.post('/api/auth/login', (req, res) => {
     const { username, password } = req.body;
@@ -112,6 +191,18 @@ app.post('/api/auth/login', (req, res) => {
 });
 
 app.get('/api/users', (req, res) => res.json(db.users.map(u => ({ id: u.id, username: u.username, avatar: u.avatar, status: u.status, bio: u.bio }))));
+// app.get('/api/users', (req, res) => {
+//     const users = db.users.map(u => ({
+//         id: u.id,
+//         username: u.username,
+//         status: u.status,
+//         bio: u.bio,
+//         avatar: u.avatar ? fileToDataImage(u.avatar) : null
+//     }));
+
+//     res.json(users);
+// });
+
 app.get('/api/messages/:id', (req, res) => res.json(db.messages.filter(m => m.channelId == req.params.id)));
 
 app.post('/api/messages', (req, res) => {
