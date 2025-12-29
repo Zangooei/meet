@@ -53,14 +53,10 @@ export const VoiceGrid: React.FC<VoiceGridProps> = ({ channel, onOpenDM }) => {
 
         peerInstance.current = peer;
 
+        // وقتی وصل شدیم و ID گرفتیم
         peer.on('open', (id) => {
             console.log('✅ Connected to PeerServer, ID:', id);
-            
-            if (!currentUser) {
-                console.error("User not loaded yet, skipping join.");
-                return;
-            }
-
+            // به بقیه خبر بده که من آمدم
             socket.emit('join-voice', { 
                 channelId: channel.id, 
                 user: currentUser, 

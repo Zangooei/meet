@@ -1,11 +1,9 @@
-import { io, Socket } from 'socket.io-client';
+import { io } from 'socket.io-client';
 import { User, Message, Channel, LoginCredentials, RegisterCredentials, AuthResponse } from '../types';
 
+// 1. آدرس کامل سرور را اینجا هاردکد کنید تا درخواست‌ها گم نشوند
 const API_URL = '/api'; 
-export const socket = io("https://meet.codefather.ir", {
-  transports: ["websocket"], // این خط حیاتیه
-  upgrade: false
-});
+export const socket: Socket = io();
 
 const fileToBase64 = (file: File): Promise<string> => {
   return new Promise((resolve, reject) => {
@@ -18,7 +16,11 @@ const fileToBase64 = (file: File): Promise<string> => {
 
 export const api = {
   login: async (creds: LoginCredentials): Promise<AuthResponse> => {
-    const res = await fetch(`${API_URL}/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(creds) });
+    const res = await fetch(`${API_URL}/auth/login`, { 
+        method: 'POST', 
+        headers: { 'Content-Type': 'application/json' }, 
+        body: JSON.stringify(creds) 
+    });
     if (!res.ok) throw new Error('Login failed');
     const data = await res.json();
     localStorage.setItem('meet_token', data.token);
@@ -29,7 +31,12 @@ export const api = {
   register: async (creds: RegisterCredentials): Promise<AuthResponse> => {
     let avatarBase64 = undefined;
     if (creds.avatar && creds.avatar instanceof File) avatarBase64 = await fileToBase64(creds.avatar);
-    const res = await fetch(`${API_URL}/auth/register`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: creds.username, password: creds.password, avatar: avatarBase64 }) });
+    
+    const res = await fetch(`${API_URL}/auth/register`, { 
+        method: 'POST', 
+        headers: { 'Content-Type': 'application/json' }, 
+        body: JSON.stringify({ username: creds.username, password: creds.password, avatar: avatarBase64 }) 
+    });
     if (!res.ok) throw new Error('Register failed');
     const data = await res.json();
     localStorage.setItem('meet_token', data.token);
@@ -37,16 +44,28 @@ export const api = {
     return data;
   },
 
-  logout: () => { localStorage.removeItem('meet_token'); localStorage.removeItem('meet_user'); socket.disconnect(); window.location.reload(); },
+  logout: () => { 
+      localStorage.removeItem('meet_token'); 
+      localStorage.removeItem('meet_user'); 
+      socket.disconnect(); 
+      window.location.reload(); 
+  },
   
   checkSession: async (): Promise<User | null> => {
     const stored = localStorage.getItem('meet_user');
-    if (stored) { socket.connect(); return JSON.parse(stored); }
+    if (stored) { 
+        if (!socket.connected) socket.connect(); 
+        return JSON.parse(stored); 
+    }
     return null;
   },
 
   updateProfile: async (userId: number, status?: string, bio?: string) => {
-      await fetch(`${API_URL}/users/profile`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ userId, status, bio }) });
+      await fetch(`${API_URL}/users/profile`, { 
+          method: 'PUT', 
+          headers: { 'Content-Type': 'application/json' }, 
+          body: JSON.stringify({ userId, status, bio }) 
+      });
   },
 
   getChannels: async (userId?: number): Promise<Channel[]> => {
@@ -55,11 +74,19 @@ export const api = {
   },
 
   markChannelRead: async (channelId: number, userId: number) => {
-    await fetch(`${API_URL}/channels/${channelId}/read`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ userId }) });
+    await fetch(`${API_URL}/channels/${channelId}/read`, { 
+        method: 'POST', 
+        headers: { 'Content-Type': 'application/json' }, 
+        body: JSON.stringify({ userId }) 
+    });
   },
 
   openDirectMessage: async (myId: number, targetId: number): Promise<Channel> => {
-    const res = await fetch(`${API_URL}/dm`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ myId, targetId }) });
+    const res = await fetch(`${API_URL}/dm`, { 
+        method: 'POST', 
+        headers: { 'Content-Type': 'application/json' }, 
+        body: JSON.stringify({ myId, targetId }) 
+    });
     return res.json();
   },
 
@@ -88,17 +115,28 @@ export const api = {
             attachment = { type, url: up.url, name: up.filename, size: up.size };
         } catch (e) { console.error("Upload error", e); throw e; }
     }
-    const res = await fetch(`${API_URL}/messages`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content, channelId, userId, attachment, replyToId }) });
+    const res = await fetch(`${API_URL}/messages`, { 
+        method: 'POST', 
+        headers: { 'Content-Type': 'application/json' }, 
+        body: JSON.stringify({ content, channelId, userId, attachment, replyToId }) 
+    });
     return res.json();
   },
 
   editMessage: async (id: number, content: string) => {
-      await fetch(`${API_URL}/messages/${id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content }) });
+      await fetch(`${API_URL}/messages/${id}`, { 
+          method: 'PUT', 
+          headers: { 'Content-Type': 'application/json' }, 
+          body: JSON.stringify({ content }) 
+      });
   },
 
   deleteMessage: async (id: number) => {
       await fetch(`${API_URL}/messages/${id}`, { method: 'DELETE' });
   },
 
-  getUsers: async (): Promise<User[]> => { const res = await fetch(`${API_URL}/users`); return res.json(); }
+  getUsers: async (): Promise<User[]> => { 
+      const res = await fetch(`${API_URL}/users`); 
+      return res.json(); 
+  }
 };
