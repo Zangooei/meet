@@ -8,6 +8,8 @@ import { useAuth } from '../context/AuthContext';
 interface VoiceGridProps {
   channel: Channel;
   onOpenDM: (targetId: number) => void;
+  isVisible: boolean; // جدید: برای مدیریت نمایش بدون قطع شدن
+  onLeave: () => void; // جدید: برای خروج اصولی از ویس
 }
 
 const QUALITY_PRESETS = {
@@ -15,7 +17,7 @@ const QUALITY_PRESETS = {
     high: { label: 'کیفیت بالا (1080p)', constraints: { width: 1920, height: 1080, frameRate: 30 } }
 };
 
-export const VoiceGrid: React.FC<VoiceGridProps> = ({ channel, onOpenDM }) => {
+export const VoiceGrid: React.FC<VoiceGridProps> = ({ channel, onOpenDM, isVisible, onLeave }) => {
   const { user: currentUser } = useAuth();
   const [connectedUsers, setConnectedUsers] = useState<User[]>([]);
   const [isMuted, setIsMuted] = useState(false);
@@ -35,21 +37,37 @@ export const VoiceGrid: React.FC<VoiceGridProps> = ({ channel, onOpenDM }) => {
   const audioRefs = useRef<Record<string, HTMLAudioElement>>({});
   const remoteStreams = useRef<Record<number, MediaStream>>({});
   const peerIdMapRef = useRef<Record<string, number>>({});
+  
+  // رفرنس‌های مربوط به آنالیز صدا
   const audioContextRef = useRef<AudioContext | null>(null);
+  const animationFrameRef = useRef<number | null>(null);
 
   // --- توابع کمکی ---
   
   const setupAudioAnalysis = (stream: MediaStream, userId: number) => {
       try {
-          if (!audioContextRef.current) {
+          // اصلاح خطای context closed: اگر کانتکست وجود ندارد یا بسته شده، یکی جدید بساز
+          if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
               audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
           }
           const ctx = audioContextRef.current;
-          if (ctx.state === 'suspended') ctx.resume();
+          
+          // اطمینان از اینکه کانتکست در حال اجراست
+          if (ctx.state === 'suspended') {
+              ctx.resume().catch(e => console.error("Resume context failed", e));
+          }
 
           if (stream.getAudioTracks().length === 0) return;
 
-          const source = ctx.createMediaStreamSource(stream);
+          // استفاده از try-catch برای ساخت سورس چون ممکن است استریم در لحظه نامعتبر باشد
+          let source;
+          try {
+             source = ctx.createMediaStreamSource(stream);
+          } catch(err) {
+             console.warn("Could not create MediaStreamSource", err);
+             return;
+          }
+
           const analyser = ctx.createAnalyser();
           analyser.fftSize = 256;
           source.connect(analyser);
@@ -68,7 +86,7 @@ export const VoiceGrid: React.FC<VoiceGridProps> = ({ channel, onOpenDM }) => {
                   if (prev[userId] === isSpeaking) return prev;
                   return { ...prev, [userId]: isSpeaking };
               });
-              requestAnimationFrame(checkVolume);
+              animationFrameRef.current = requestAnimationFrame(checkVolume);
           };
           checkVolume();
       } catch (e) { console.error("Audio analysis setup failed", e); }
@@ -120,6 +138,10 @@ export const VoiceGrid: React.FC<VoiceGridProps> = ({ channel, onOpenDM }) => {
   };
 
   useEffect(() => {
+    // پاکسازی استیت‌های قبلی هنگام تغییر کانال صوتی
+    setConnectedUsers([]);
+    setSpeakingUsers({});
+    
     navigator.mediaDevices.getUserMedia({ video: false, audio: true })
     .then(stream => {
         myStream.current = stream;
@@ -171,15 +193,35 @@ export const VoiceGrid: React.FC<VoiceGridProps> = ({ channel, onOpenDM }) => {
     });
 
     return () => {
+        // پاکسازی کامل هنگام Unmount (زمانی که واقعا کاربر Leave میدهد)
         socket.emit('leave-voice');
         socket.off('user-connected');
         socket.off('user-disconnected');
         socket.off('voice-update');
+        
         if (peerInstance.current) peerInstance.current.destroy();
-        if (myStream.current) myStream.current.getTracks().forEach(t => t.stop());
-        if (screenStream.current) screenStream.current.getTracks().forEach(t => t.stop());
-        Object.values(audioRefs.current).forEach(audio => audio.remove());
-        if (audioContextRef.current) audioContextRef.current.close();
+        
+        if (myStream.current) {
+            myStream.current.getTracks().forEach(t => t.stop());
+            myStream.current = null;
+        }
+        if (screenStream.current) {
+            screenStream.current.getTracks().forEach(t => t.stop());
+            screenStream.current = null;
+        }
+
+        Object.values(audioRefs.current).forEach(audio => {
+            audio.pause();
+            audio.remove();
+        });
+        audioRefs.current = {};
+
+        // بستن صحیح لوپ انیمیشن و AudioContext
+        if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
+        if (audioContextRef.current) {
+            audioContextRef.current.close().catch(e => console.log("Context close err", e));
+            audioContextRef.current = null;
+        }
     };
   }, [channel.id]);
 
@@ -274,8 +316,6 @@ export const VoiceGrid: React.FC<VoiceGridProps> = ({ channel, onOpenDM }) => {
           };
       } catch (e) { console.error("Screen share failed", e); }
   };
-
-  const handleLeave = () => { window.location.reload(); };
   
   const spotlightUser = connectedUsers.find(u => u.id === spotlightId);
   const otherUsers = connectedUsers.filter(u => u.id !== spotlightId);
@@ -318,8 +358,9 @@ export const VoiceGrid: React.FC<VoiceGridProps> = ({ channel, onOpenDM }) => {
       );
   };
 
+  // تغییر اصلی: استفاده از display: none برای مخفی کردن به جای حذف کامل کامپوننت
   return (
-    <div className="flex-1 bg-[#0f0f12] p-4 flex flex-col h-full relative overflow-hidden">
+    <div className="flex-1 bg-[#0f0f12] p-4 flex flex-col h-full relative overflow-hidden" style={{ display: isVisible ? 'flex' : 'none' }}>
       <div className="absolute inset-0 bg-gradient-to-br from-neonPurple/5 to-neonCyan/5 pointer-events-none" />
       <div className="relative z-10 mb-4 border-b border-white/5 pb-4 flex justify-between items-center h-16 shrink-0">
         <h2 className="text-2xl font-bold text-white flex items-center"><Icon name="volume" className="ml-3 text-neonCyan" /> {channel.name}</h2>
@@ -367,7 +408,7 @@ export const VoiceGrid: React.FC<VoiceGridProps> = ({ channel, onOpenDM }) => {
 
       <div className="mt-auto pt-2 flex flex-col items-center relative z-20 gap-4 shrink-0">
         <div className="flex gap-5 p-4 bg-[#1a1a20]/90 backdrop-blur-xl rounded-3xl border border-white/10 shadow-2xl items-center">
-           <button onClick={handleLeave} className="w-14 h-14 rounded-full bg-red-600 hover:bg-red-700 flex items-center justify-center text-white transition-all transform hover:scale-110 shadow-lg shadow-red-600/40" title="خروج"><Icon name="phone-off" size={28} /></button>
+           <button onClick={onLeave} className="w-14 h-14 rounded-full bg-red-600 hover:bg-red-700 flex items-center justify-center text-white transition-all transform hover:scale-110 shadow-lg shadow-red-600/40" title="خروج"><Icon name="phone-off" size={28} /></button>
            <button onClick={toggleMute} className={`w-14 h-14 rounded-full flex items-center justify-center text-white transition-all transform hover:scale-110 ${isMuted ? 'bg-red-600 shadow-red-600/50' : 'bg-white/10 hover:bg-white/20'}`} title="میکروفون"><Icon name="microphone" size={24} /></button>
            <button onClick={toggleDeafen} className={`w-14 h-14 rounded-full flex items-center justify-center text-white transition-all transform hover:scale-110 ${isDeafened ? 'bg-red-600 shadow-red-600/50' : 'bg-white/10 hover:bg-white/20'}`} title="صدا"><Icon name="headphones" size={24} /></button>
            <div className="w-px h-8 bg-white/20 mx-1"></div>

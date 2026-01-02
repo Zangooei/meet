@@ -10,7 +10,13 @@ import { Channel, Message } from './types';
 const MainApp = () => {
   const { user, logout, usersCache } = useAuth();
   const [channels, setChannels] = useState<Channel[]>([]);
+  
+  // activeChannelId: کانالی که کاربر در حال حاضر مشاهده می‌کند (می‌تواند متنی یا صوتی باشد)
   const [activeChannelId, setActiveChannelId] = useState<number>(0);
+  
+  // joinedVoiceId: کانال ویسی که کاربر به آن متصل است (مستقل از اینکه چه صفحه‌ای را می‌بیند)
+  const [joinedVoiceId, setJoinedVoiceId] = useState<number | null>(null);
+
   const [messages, setMessages] = useState<Message[]>([]);
   const [isLoadingChannels, setIsLoadingChannels] = useState(true);
 
@@ -47,9 +53,12 @@ const MainApp = () => {
         if (fetchedChannels.length > 0) {
           const initialId = fetchedChannels[0].id;
           setActiveChannelId(initialId);
-          const msgs = await api.getMessages(initialId);
-          setMessages(msgs);
-          api.markChannelRead(initialId, user.id);
+          // اگر کانال اولیه متنی بود، پیام‌ها را لود کن
+          if (fetchedChannels[0].type === 'text') {
+              const msgs = await api.getMessages(initialId);
+              setMessages(msgs);
+              api.markChannelRead(initialId, user.id);
+          }
         }
       } catch (err) {
         console.error("Error loading data:", err);
@@ -62,7 +71,13 @@ const MainApp = () => {
 
   useEffect(() => {
     if (!activeChannelId) return;
-    socket.emit('join-text', activeChannelId);
+    
+    // اگر کانال فعلی متنی است، باید به سوکت روم متنی وصل شویم
+    // (اتصال به ویس به صورت جداگانه در کامپوننت VoiceGrid مدیریت می‌شود)
+    const activeCh = channels.find(c => c.id === activeChannelId);
+    if (activeCh && (activeCh.type === 'text' || activeCh.type === 'dm')) {
+        socket.emit('join-text', activeChannelId);
+    }
 
     const handleNewMessage = (msg: Message) => {
       if (activeChannelId === msg.channelId) {
@@ -108,14 +123,12 @@ const MainApp = () => {
       socket.off('voice-update', handleVoiceUpdate);
       socket.off('dm-update', handleDMUpdate);
     };
-  }, [activeChannelId, user]);
+  }, [activeChannelId, user, channels]);
 
   const handleSelectChannel = async (id: number) => {
     // چک کنیم کانال وجود دارد (ممکن است تازه اضافه شده باشد)
-    // اگر در لیست نبود (باگ لحظه‌ای)، فعلاً کاری نکنیم یا دوباره فچ کنیم
     let targetChannel = channels.find(c => c.id === id);
     
-    // اگر کانال جدید (DM) بود و هنوز در استیت نبود، موقتا پیداش کنیم
     if (!targetChannel) {
         const fresh = await api.getChannels(user?.id);
         targetChannel = fresh.find(c => c.id === id);
@@ -124,8 +137,15 @@ const MainApp = () => {
 
     if (!targetChannel) return;
 
+    // تغییر کانال فعال (چیزی که کاربر می‌بیند)
     setActiveChannelId(id);
 
+    // اگر روی کانال صوتی کلیک کرد، به آن جوین می‌شود
+    if (targetChannel.type === 'voice') {
+        setJoinedVoiceId(id);
+    }
+
+    // اگر کانال متنی بود، پیام‌ها را لود کن
     if (targetChannel.type === 'text' || targetChannel.type === 'dm') {
       const msgs = await api.getMessages(id);
       setMessages(msgs);
@@ -136,17 +156,18 @@ const MainApp = () => {
     } 
   };
 
-  const handleSendMessage = async (text: string, file?: File) => {
+  const handleSendMessage = async (text: string, file?: File, replyToId?: number) => {
     if (!user) return;
     try {
-      await api.sendMessage(text, activeChannelId, user.id, file);
+      await api.sendMessage(text, activeChannelId, user.id, file, replyToId);
     } catch (e) { console.error("Failed to send", e); }
   };
 
   if (!user) return null;
   if (isLoadingChannels) return <div className="flex h-screen w-screen items-center justify-center bg-[#0f0f12] text-white">در حال بارگزاری اطلاعات ...</div>;
 
-  const activeChannel = channels.find(c => c.id === activeChannelId) || channels[0];
+  const activeChannel = channels.find(c => c.id === activeChannelId);
+  const joinedVoiceChannel = channels.find(c => c.id === joinedVoiceId);
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-[#0f0f12] text-gray-200 font-sans" dir="rtl">
@@ -155,21 +176,31 @@ const MainApp = () => {
         activeChannelId={activeChannelId}
         onSelectChannel={handleSelectChannel}
         currentUser={user}
-        usersCache={usersCache} // ارسال لیست یوزرها برای نمایش نام درست در سایدبار
+        usersCache={usersCache} 
       />
       <main className="flex-1 flex flex-col min-w-0 bg-[#0f0f12] relative z-10">
         <div className="absolute top-4 left-4 z-50">
-             <button onClick={logout} className="bg-red-500/10 hover:bg-red-500/20 text-red-500 px-3 py-1 rounded border border-red-500/20 text-xs transition-colors">خروج</button>
+             <button onClick={logout} className="bg-red-500/10 hover:bg-red-500/20 text-red-500 px-3 py-1 rounded border border-red-500/20 text-xs transition-colors">خروج از حساب</button>
         </div>
-        {activeChannel?.type === 'voice' ? (
-           <VoiceGrid channel={activeChannel} onOpenDM={handleOpenDM} />
-        ) : (
+        
+        {/* VoiceGrid همیشه رندر می‌شود اگر به کانالی متصل باشیم، اما فقط وقتی آن را انتخاب کرده باشیم نمایش داده می‌شود (display block/none) */}
+        {joinedVoiceChannel && (
+           <VoiceGrid 
+             channel={joinedVoiceChannel} 
+             onOpenDM={handleOpenDM}
+             isVisible={activeChannelId === joinedVoiceId}
+             onLeave={() => setJoinedVoiceId(null)}
+           />
+        )}
+
+        {/* ChatArea فقط وقتی نمایش داده می‌شود که کانال فعال یک کانال متنی باشد */}
+        {(activeChannel?.type === 'text' || activeChannel?.type === 'dm') && (
            <ChatArea 
              channel={activeChannel}
              messages={messages}
              users={usersCache}
              onSendMessage={handleSendMessage}
-             onOpenDM={handleOpenDM} // ارسال تابع به چت برای کلیک روی آواتارها
+             onOpenDM={handleOpenDM} 
            />
         )}
       </main>
